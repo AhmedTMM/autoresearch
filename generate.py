@@ -67,7 +67,7 @@ def main():
             prompt = VHDL_PROMPTS[i % len(VHDL_PROMPTS)]
             code = generate_vhdl(model, tokenizer, prompt, device,
                                max_new_tokens=args.max_tokens, temperature=args.temperature)
-            success, error = compile_vhdl(code)
+            success, error, _ = compile_vhdl(code)
             if success:
                 compiled_ok += 1
             results.append((prompt, code, success, error))
@@ -101,7 +101,7 @@ def main():
             print(code)
 
             if args.compile:
-                success, error = compile_vhdl(code)
+                success, error, _ = compile_vhdl(code)
                 print(f"\n--- GHDL: {'PASS' if success else 'FAIL'} ---")
                 if error:
                     print(error)

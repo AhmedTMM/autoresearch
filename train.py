@@ -254,26 +254,124 @@ def generate_vhdl(model, tokenizer, prompt, device, max_new_tokens=512, temperat
     return tokenizer.decode(x[0].tolist())
 
 
-def compile_vhdl(code, timeout=10):
-    """Try to compile VHDL with GHDL. Returns (success, error_msg)."""
+def compile_vhdl(code, mode="analyze", timeout=10):
+    """
+    Try to compile VHDL with GHDL.
+    mode="syntax"  -> ghdl -s (syntax check only, easier to pass)
+    mode="analyze" -> ghdl -a (full analysis with type checking)
+    Returns (success: bool, error_msg: str or None, error_count: int)
+    """
     with tempfile.NamedTemporaryFile(mode='w', suffix='.vhd', delete=False) as f:
         f.write(code)
         tmp_path = f.name
     try:
+        flag = "-s" if mode == "syntax" else "-a"
         result = subprocess.run(
-            ["ghdl", "-a", "--std=08", tmp_path],
+            ["ghdl", flag, "--std=08", tmp_path],
             capture_output=True, text=True, timeout=timeout,
         )
         success = result.returncode == 0
         error = result.stderr.strip() if not success else None
-        return success, error
+        error_count = error.count(":error:") if error else 0
+        return success, error, error_count
     except (subprocess.TimeoutExpired, FileNotFoundError):
-        return False, "ghdl error"
+        return False, "ghdl error", 99
     finally:
         os.unlink(tmp_path)
         work_cf = os.path.join(os.getcwd(), "work-obj08.cf")
         if os.path.exists(work_cf):
             os.unlink(work_cf)
+
+# ---------------------------------------------------------------------------
+# Training (only runs when executed directly)
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Compiler feedback: rejection sampling
+# ---------------------------------------------------------------------------
+
+# Phase split: 75% pretraining, 25% compiler feedback
+PRETRAIN_RATIO = 0.75
+FEEDBACK_LR = 1e-4          # lower LR for feedback fine-tuning
+GENERATE_BATCH = 32         # samples to generate per feedback round
+GENERATE_MAX_TOKENS = 512   # max tokens per generated sample
+GENERATE_TEMPERATURE = 0.9  # slightly higher temp for diversity
+
+
+@torch.no_grad()
+def generate_vhdl_batch(model, tokenizer, device, n=GENERATE_BATCH,
+                        max_new_tokens=GENERATE_MAX_TOKENS, temperature=GENERATE_TEMPERATURE):
+    """Generate multiple VHDL samples from different prompts."""
+    samples = []
+    for i in range(n):
+        prompt = VHDL_PROMPTS[i % len(VHDL_PROMPTS)]
+        code = generate_vhdl(model, tokenizer, prompt, device,
+                           max_new_tokens=max_new_tokens, temperature=temperature)
+        samples.append(code)
+    return samples
+
+
+def score_vhdl(code):
+    """
+    Score generated VHDL on a 0-1 scale using progressive compiler checks.
+    0.0 = total garbage
+    0.3 = has VHDL structure but fails syntax
+    0.6 = passes syntax check (ghdl -s)
+    1.0 = passes full analysis (ghdl -a)
+    """
+    text_lower = code.lower()
+
+    # Basic structural check: does it look like VHDL at all?
+    has_library = "library" in text_lower
+    has_entity = "entity" in text_lower
+    has_arch = "architecture" in text_lower
+    has_end = "end" in text_lower
+    structural_score = sum([has_library, has_entity, has_arch, has_end]) / 4.0
+
+    if structural_score < 0.5:
+        return 0.0  # doesn't even look like VHDL
+
+    # Syntax check (lenient)
+    syntax_ok, _, syntax_errors = compile_vhdl(code, mode="syntax")
+    if not syntax_ok:
+        # Partial credit: fewer errors = better
+        return 0.3 * structural_score * max(0, 1.0 - syntax_errors / 20.0)
+
+    # Full analysis (strict)
+    analyze_ok, _, analyze_errors = compile_vhdl(code, mode="analyze")
+    if analyze_ok:
+        return 1.0  # perfect score
+    else:
+        # Passed syntax but failed analysis — still pretty good
+        return 0.6 + 0.4 * max(0, 1.0 - analyze_errors / 10.0)
+
+
+def make_feedback_batch(good_samples, tokenizer, device, batch_size, seq_len):
+    """
+    Turn a list of VHDL strings into a training batch.
+    Tokenize, pack into fixed-length sequences, return (x, y).
+    """
+    bos = tokenizer.get_bos_token_id()
+    all_tokens = []
+    for code in good_samples:
+        ids = [bos] + tokenizer.encode(code)
+        all_tokens.extend(ids)
+
+    if len(all_tokens) < seq_len + 1:
+        return None, None  # not enough tokens
+
+    # Pack into batch
+    row_len = seq_len + 1
+    num_rows = min(batch_size, len(all_tokens) // row_len)
+    if num_rows == 0:
+        return None, None
+
+    buf = torch.tensor(all_tokens[:num_rows * row_len], dtype=torch.long)
+    buf = buf.view(num_rows, row_len)
+    x = buf[:, :-1].to(device)
+    y = buf[:, 1:].to(device)
+    return x, y
+
 
 # ---------------------------------------------------------------------------
 # Training (only runs when executed directly)
@@ -334,11 +432,12 @@ if __name__ == "__main__":
     train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
     x, y, epoch = next(train_loader)
 
-    print(f"Time budget: {TIME_BUDGET}s")
+    pretrain_budget = int(TIME_BUDGET * PRETRAIN_RATIO)
+    feedback_budget = TIME_BUDGET - pretrain_budget
+    print(f"Time budget: {TIME_BUDGET}s (pretrain: {pretrain_budget}s, feedback: {feedback_budget}s)")
     print(f"Gradient accumulation steps: {grad_accum_steps}")
 
     # Schedules
-
     def get_lr_multiplier(progress):
         if progress < WARMUP_RATIO:
             return progress / WARMUP_RATIO if WARMUP_RATIO > 0 else 1.0
@@ -348,9 +447,13 @@ if __name__ == "__main__":
             cooldown = (1.0 - progress) / WARMDOWN_RATIO
             return cooldown * 1.0 + (1 - cooldown) * FINAL_LR_FRAC
 
-    # -------------------------------------------------------------------
-    # Training loop
-    # -------------------------------------------------------------------
+    # ===================================================================
+    # PHASE 1: Standard pretraining on VHDL corpus
+    # ===================================================================
+
+    print(f"\n{'='*60}")
+    print(f"PHASE 1: Pretraining ({pretrain_budget}s)")
+    print(f"{'='*60}")
 
     t_start_training = time.time()
     smooth_train_loss = 0
@@ -367,8 +470,8 @@ if __name__ == "__main__":
             loss.backward()
             x, y, epoch = next(train_loader)
 
-        # Progress and schedules
-        progress = min(total_training_time / TIME_BUDGET, 1.0)
+        # Progress and schedules (relative to pretrain budget)
+        progress = min(total_training_time / pretrain_budget, 1.0)
         lrm = get_lr_multiplier(progress)
         for group in optimizer.param_groups:
             group["lr"] = LEARNING_RATE * lrm
@@ -394,9 +497,9 @@ if __name__ == "__main__":
         debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))
         pct_done = 100 * progress
         tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
-        remaining = max(0, TIME_BUDGET - total_training_time)
+        remaining = max(0, pretrain_budget - total_training_time)
 
-        print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
+        print(f"\r[P1] step {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
 
         # GC management
         if step == 0:
@@ -404,15 +507,122 @@ if __name__ == "__main__":
 
         step += 1
 
-        # Time's up
-        if step > 10 and total_training_time >= TIME_BUDGET:
+        # Time's up for phase 1
+        if step > 10 and total_training_time >= pretrain_budget:
             break
 
     print()
+    pretrain_steps = step
+    pretrain_tokens = step * TOTAL_BATCH_SIZE
+    print(f"Phase 1 done: {pretrain_steps} steps, {pretrain_tokens/1e6:.1f}M tokens")
 
-    total_tokens = step * TOTAL_BATCH_SIZE
+    # ===================================================================
+    # PHASE 2: Compiler feedback (rejection sampling fine-tuning)
+    # ===================================================================
 
-    # Final eval
+    print(f"\n{'='*60}")
+    print(f"PHASE 2: Compiler feedback ({feedback_budget}s)")
+    print(f"{'='*60}")
+
+    # Lower learning rate for fine-tuning
+    for group in optimizer.param_groups:
+        group["lr"] = FEEDBACK_LR
+
+    feedback_start = time.time()
+    feedback_time = 0
+    feedback_round = 0
+    total_generated = 0
+    total_accepted = 0
+    feedback_steps = 0
+
+    while feedback_time < feedback_budget:
+        feedback_round += 1
+
+        # --- Generate samples ---
+        model.eval()
+        print(f"\n[P2] Round {feedback_round}: generating {GENERATE_BATCH} samples...", end="", flush=True)
+        with autocast_ctx:
+            samples = generate_vhdl_batch(model, tokenizer, device)
+        total_generated += len(samples)
+
+        # --- Score each sample with GHDL ---
+        scored = []
+        for code in samples:
+            score = score_vhdl(code)
+            scored.append((code, score))
+
+        # Separate into tiers
+        perfect = [code for code, s in scored if s >= 1.0]      # passes full analysis
+        good = [code for code, s in scored if 0.6 <= s < 1.0]   # passes syntax
+        partial = [code for code, s in scored if 0.3 <= s < 0.6] # has structure
+
+        n_perfect = len(perfect)
+        n_good = len(good)
+        n_partial = len(partial)
+        n_rejected = len(samples) - n_perfect - n_good - n_partial
+        print(f" perfect={n_perfect}, good={n_good}, partial={n_partial}, rejected={n_rejected}")
+
+        # --- Build training batch from accepted samples ---
+        # Priority: perfect > good > partial
+        # Weight by quality: perfect samples repeated more
+        accepted = []
+        accepted.extend(perfect * 3)    # triple weight for compilable code
+        accepted.extend(good * 2)       # double weight for syntax-valid
+        accepted.extend(partial)        # single weight for structural
+        total_accepted += len(perfect) + len(good) + len(partial)
+
+        if not accepted:
+            print(f"[P2] Round {feedback_round}: no usable samples, continuing with corpus...")
+            # Fall back to corpus training for one step
+            model.train()
+            with autocast_ctx:
+                loss = model(x, y)
+            loss.backward()
+            optimizer.step()
+            model.zero_grad(set_to_none=True)
+            x, y, epoch = next(train_loader)
+            feedback_steps += 1
+            feedback_time = time.time() - feedback_start
+            continue
+
+        # --- Fine-tune on accepted samples ---
+        model.train()
+        fb_x, fb_y = make_feedback_batch(accepted, tokenizer, device,
+                                         DEVICE_BATCH_SIZE, MAX_SEQ_LEN)
+
+        if fb_x is not None:
+            # Train on compiler-approved code
+            with autocast_ctx:
+                fb_loss = model(fb_x, fb_y)
+            fb_loss.backward()
+            optimizer.step()
+            model.zero_grad(set_to_none=True)
+            feedback_steps += 1
+            print(f"[P2] Round {feedback_round}: feedback loss={fb_loss.item():.4f}")
+
+        # Also do a corpus step to prevent forgetting
+        with autocast_ctx:
+            corpus_loss = model(x, y)
+        corpus_loss.backward()
+        optimizer.step()
+        model.zero_grad(set_to_none=True)
+        x, y, epoch = next(train_loader)
+        feedback_steps += 1
+
+        feedback_time = time.time() - feedback_start
+        remaining = max(0, feedback_budget - feedback_time)
+        print(f"[P2] Round {feedback_round}: {feedback_time:.0f}s elapsed, {remaining:.0f}s remaining")
+
+    print(f"\nPhase 2 done: {feedback_round} rounds, {feedback_steps} steps")
+    print(f"  Generated: {total_generated}, Accepted: {total_accepted} ({100*total_accepted/max(1,total_generated):.0f}%)")
+
+    total_training_time += feedback_time
+    total_tokens = pretrain_tokens + feedback_steps * TOTAL_BATCH_SIZE
+
+    # ===================================================================
+    # Final evaluation
+    # ===================================================================
+
     model.eval()
     with autocast_ctx:
         val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
@@ -420,34 +630,42 @@ if __name__ == "__main__":
     # Save checkpoint
     torch.save(model.state_dict(), "model.pt")
 
-    # -------------------------------------------------------------------
-    # VHDL Compile-rate evaluation
-    # -------------------------------------------------------------------
+    # Compile-rate evaluation
     NUM_COMPILE_SAMPLES = 20
     compiled_ok = 0
+    syntax_ok_count = 0
     print(f"\nCompile evaluation ({NUM_COMPILE_SAMPLES} samples)...")
     for i in range(NUM_COMPILE_SAMPLES):
         prompt = VHDL_PROMPTS[i % len(VHDL_PROMPTS)]
         with autocast_ctx:
             code = generate_vhdl(model, tokenizer, prompt, device)
-        success, error = compile_vhdl(code)
-        if success:
+        s_ok, _, _ = compile_vhdl(code, mode="syntax")
+        a_ok, _, _ = compile_vhdl(code, mode="analyze")
+        if a_ok:
             compiled_ok += 1
-        status = "OK" if success else "FAIL"
+        if s_ok:
+            syntax_ok_count += 1
+        status = "COMPILE" if a_ok else ("SYNTAX" if s_ok else "FAIL")
         print(f"  [{i+1}/{NUM_COMPILE_SAMPLES}] {status}")
     compile_rate = compiled_ok / NUM_COMPILE_SAMPLES
+    syntax_rate = syntax_ok_count / NUM_COMPILE_SAMPLES
 
     # Final summary
     t_end = time.time()
-    startup_time = t_start_training - t_start
 
     print("---")
     print(f"val_bpb:          {val_bpb:.6f}")
     print(f"compile_rate:     {compile_rate:.4f}")
+    print(f"syntax_rate:      {syntax_rate:.4f}")
     print(f"compiled:         {compiled_ok}/{NUM_COMPILE_SAMPLES}")
+    print(f"syntax_ok:        {syntax_ok_count}/{NUM_COMPILE_SAMPLES}")
     print(f"training_seconds: {total_training_time:.1f}")
+    print(f"pretrain_seconds: {pretrain_budget:.0f}")
+    print(f"feedback_seconds: {feedback_time:.1f}")
+    print(f"feedback_rounds:  {feedback_round}")
+    print(f"feedback_accept:  {total_accepted}/{total_generated}")
     print(f"total_seconds:    {t_end - t_start:.1f}")
     print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
-    print(f"num_steps:        {step}")
+    print(f"num_steps:        {pretrain_steps + feedback_steps}")
     print(f"num_params_M:     {num_params / 1e6:.1f}")
     print(f"depth:            {DEPTH}")

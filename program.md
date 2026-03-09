@@ -34,23 +34,33 @@ Once you get confirmation, kick off the experimentation.
 - **Batch size**: TOTAL_BATCH_SIZE=2^17, DEVICE_BATCH_SIZE=32. Can increase if no OOM.
 - **32GB unified memory**: Shared between CPU and GPU. Monitor memory — don't OOM the system.
 
-## Two-Phase Strategy
+## Two-Phase Training (built into train.py)
 
-### Phase 1: Architecture Search (30 min per experiment)
-Each experiment trains for 30 minutes. The agent iterates rapidly on architecture and hyperparameters. Goal: find the configuration that achieves the lowest val_bpb.
+Each training run automatically executes two phases:
 
-Typical experiments in this phase:
-- Model depth (6, 8, 10, 12 layers)
-- Model width (n_embd via ASPECT_RATIO)
-- Attention patterns (GQA ratios, head counts)
-- Activation functions (ReLU², GELU, SiLU, SwiGLU)
-- Learning rate, weight decay, batch size
-- Positional encoding variants
-- Normalization strategies
+### Phase 1: Pretraining (75% of time budget = ~22.5 min)
+Standard language modeling on the VHDL corpus. The model learns VHDL syntax, structure, and patterns.
+
+### Phase 2: Compiler Feedback (25% of time budget = ~7.5 min)
+Rejection sampling fine-tuning loop:
+1. Generate 32 VHDL samples from the model
+2. Score each with GHDL compiler (progressive: structural check → syntax → full analysis)
+3. Keep samples that score well, weighted by quality (compilable code gets 3x weight)
+4. Fine-tune the model on accepted samples
+5. Also train on corpus data to prevent catastrophic forgetting
+6. Repeat until time runs out
+
+This teaches the model to produce VHDL that actually compiles, not just text that looks like VHDL.
+
+### What the agent can experiment with:
+- PRETRAIN_RATIO (how much time for pretraining vs feedback)
+- FEEDBACK_LR (learning rate for fine-tuning phase)
+- GENERATE_BATCH (samples per feedback round)
+- GENERATE_TEMPERATURE (diversity of generated samples)
+- Scoring weights (how much to reward syntax vs full compilation)
+- Model architecture, optimizer, hyperparameters (everything in Phase 1)
 - MLP ratio (4x vs 3x vs 8/3x for SwiGLU)
-
-### Phase 2: Final Training (extended)
-Once the agent has found a strong configuration through Phase 1 experiments, it should note the best config in results.tsv with a "BEST" tag. The human can then do an extended training run by temporarily increasing TIME_BUDGET in prepare.py.
+- Activation functions, attention patterns, etc.
 
 ## Experimentation
 
@@ -90,8 +100,14 @@ Once the script finishes it prints a summary like this:
 ---
 val_bpb:          1.234567
 compile_rate:     0.3500
+syntax_rate:      0.6000
 compiled:         7/20
+syntax_ok:        12/20
 training_seconds: 1800.1
+pretrain_seconds: 1350
+feedback_seconds: 450.1
+feedback_rounds:  8
+feedback_accept:  45/256
 total_seconds:    1825.9
 total_tokens_M:   50.3
 num_steps:        750
@@ -102,7 +118,7 @@ depth:            8
 You can extract the key metrics from the log file:
 
 ```
-grep "^val_bpb:\|^compile_rate:" run.log
+grep "^val_bpb:\|^compile_rate:\|^syntax_rate:\|^feedback_accept:" run.log
 ```
 
 ## Logging results
