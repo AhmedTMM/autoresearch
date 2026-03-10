@@ -201,7 +201,7 @@ ASPECT_RATIO = 48       # model_dim = depth * ASPECT_RATIO
 HEAD_DIM = 64           # target head dimension for attention
 
 # Optimization
-TOTAL_BATCH_SIZE = 2**15  # ~32K tokens per step (smaller = more steps in budget)
+TOTAL_BATCH_SIZE = 2**14  # ~16K tokens per step — more optimizer steps in budget
 LEARNING_RATE = 3e-4      # AdamW learning rate
 WEIGHT_DECAY = 0.1
 ADAM_BETAS = (0.9, 0.95)
@@ -279,7 +279,7 @@ def compile_vhdl(code, mode="analyze", timeout=10):
         error = result.stderr.strip() if not success else None
         error_count = error.count(":error:") if error else 0
         return success, error, error_count
-    except (subprocess.TimeoutExpired, FileNotFoundError):
+    except (subprocess.TimeoutExpired, FileNotFoundError, UnicodeDecodeError):
         return False, "ghdl error", 99
     finally:
         os.unlink(tmp_path)
@@ -478,6 +478,7 @@ if __name__ == "__main__":
         lrm = get_lr_multiplier(progress)
         for group in optimizer.param_groups:
             group["lr"] = LEARNING_RATE * lrm
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         model.zero_grad(set_to_none=True)
 
