@@ -295,7 +295,7 @@ def compile_vhdl(code, mode="analyze", timeout=10):
 
 # Phase split: 90% pretraining, 10% compiler feedback
 # Generation on MPS is extremely slow (~60s per sample), so minimize feedback phase
-PRETRAIN_RATIO = 0.90
+PRETRAIN_RATIO = 1.00     # skip feedback: 0% accepted, wastes 90s on generation
 FEEDBACK_LR = 1e-4          # lower LR for feedback fine-tuning
 GENERATE_BATCH = 8          # samples to generate per feedback round
 GENERATE_MAX_TOKENS = 256   # max tokens per generated sample (halved for speed)
