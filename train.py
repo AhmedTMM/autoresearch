@@ -181,10 +181,8 @@ class GPT(nn.Module):
             x = block(x, cos_sin)
         x = norm(x)
 
-        softcap = 15
         logits = self.lm_head(x)
         logits = logits.float()
-        logits = softcap * torch.tanh(logits / softcap)
 
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
@@ -440,15 +438,14 @@ if __name__ == "__main__":
     print(f"Time budget: {TIME_BUDGET}s (pretrain: {pretrain_budget}s, feedback: {feedback_budget}s)")
     print(f"Gradient accumulation steps: {grad_accum_steps}")
 
-    # Schedules
+    # Schedules (cosine with warmup)
+    import math as _math
     def get_lr_multiplier(progress):
         if progress < WARMUP_RATIO:
             return progress / WARMUP_RATIO if WARMUP_RATIO > 0 else 1.0
-        elif progress < 1.0 - WARMDOWN_RATIO:
-            return 1.0
         else:
-            cooldown = (1.0 - progress) / WARMDOWN_RATIO
-            return cooldown * 1.0 + (1 - cooldown) * FINAL_LR_FRAC
+            decay_progress = (progress - WARMUP_RATIO) / (1.0 - WARMUP_RATIO)
+            return FINAL_LR_FRAC + (1.0 - FINAL_LR_FRAC) * 0.5 * (1.0 + _math.cos(_math.pi * decay_progress))
 
     # ===================================================================
     # PHASE 1: Standard pretraining on VHDL corpus
