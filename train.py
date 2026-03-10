@@ -200,7 +200,7 @@ HEAD_DIM = 64           # target head dimension for attention
 
 # Optimization
 TOTAL_BATCH_SIZE = 2**14  # ~16K tokens per step — more optimizer steps in budget
-LEARNING_RATE = 3e-4      # AdamW learning rate
+LEARNING_RATE = 4e-4      # slightly higher LR with cosine schedule
 WEIGHT_DECAY = 0.1
 ADAM_BETAS = (0.9, 0.95)
 WARMUP_RATIO = 0.05
