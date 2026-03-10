@@ -293,11 +293,12 @@ def compile_vhdl(code, mode="analyze", timeout=10):
 # Compiler feedback: rejection sampling
 # ---------------------------------------------------------------------------
 
-# Phase split: 75% pretraining, 25% compiler feedback
-PRETRAIN_RATIO = 0.75
+# Phase split: 90% pretraining, 10% compiler feedback
+# Generation on MPS is extremely slow (~60s per sample), so minimize feedback phase
+PRETRAIN_RATIO = 0.90
 FEEDBACK_LR = 1e-4          # lower LR for feedback fine-tuning
-GENERATE_BATCH = 16         # samples to generate per feedback round (reduced for speed)
-GENERATE_MAX_TOKENS = 512   # max tokens per generated sample
+GENERATE_BATCH = 8          # samples to generate per feedback round
+GENERATE_MAX_TOKENS = 256   # max tokens per generated sample (halved for speed)
 GENERATE_TEMPERATURE = 0.9  # slightly higher temp for diversity
 
 
@@ -631,7 +632,7 @@ if __name__ == "__main__":
     torch.save(model.state_dict(), "model.pt")
 
     # Compile-rate evaluation
-    NUM_COMPILE_SAMPLES = 20
+    NUM_COMPILE_SAMPLES = 10
     compiled_ok = 0
     syntax_ok_count = 0
     print(f"\nCompile evaluation ({NUM_COMPILE_SAMPLES} samples)...")
