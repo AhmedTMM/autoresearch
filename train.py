@@ -15,7 +15,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
+from prepare import MAX_SEQ_LEN, TIME_BUDGET as _TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
+
+# Override time budget: 15 minutes for effective training on 16GB M4
+TIME_BUDGET = 900
 
 # ---------------------------------------------------------------------------
 # GPT Model (MPS-compatible, no Flash Attention, no bfloat16)
@@ -196,7 +199,7 @@ ASPECT_RATIO = 48       # model_dim = depth * ASPECT_RATIO
 HEAD_DIM = 64           # target head dimension for attention
 
 # Optimization
-TOTAL_BATCH_SIZE = 2**17  # ~131K tokens per optimizer step
+TOTAL_BATCH_SIZE = 2**16  # ~65K tokens per optimizer step (halved for faster steps)
 LEARNING_RATE = 3e-4      # AdamW learning rate
 WEIGHT_DECAY = 0.1
 ADAM_BETAS = (0.9, 0.95)
@@ -204,9 +207,9 @@ WARMUP_RATIO = 0.05
 WARMDOWN_RATIO = 0.5
 FINAL_LR_FRAC = 0.0
 
-# Model size
-DEPTH = 8               # number of transformer layers
-DEVICE_BATCH_SIZE = 32   # per-device batch size
+# Model size — tuned for 16GB M4, ~40M params
+DEPTH = 10              # number of transformer layers
+DEVICE_BATCH_SIZE = 16   # per-device batch size (halved for 16GB RAM)
 
 # ---------------------------------------------------------------------------
 # Helpers (importable by generate.py)
@@ -293,7 +296,7 @@ def compile_vhdl(code, mode="analyze", timeout=10):
 # Phase split: 75% pretraining, 25% compiler feedback
 PRETRAIN_RATIO = 0.75
 FEEDBACK_LR = 1e-4          # lower LR for feedback fine-tuning
-GENERATE_BATCH = 32         # samples to generate per feedback round
+GENERATE_BATCH = 16         # samples to generate per feedback round (reduced for speed)
 GENERATE_MAX_TOKENS = 512   # max tokens per generated sample
 GENERATE_TEMPERATURE = 0.9  # slightly higher temp for diversity
 
