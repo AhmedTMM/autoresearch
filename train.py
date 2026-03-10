@@ -17,8 +17,8 @@ import torch.nn.functional as F
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET as _TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
-# Override time budget: 15 minutes for effective training on 16GB M4
-TIME_BUDGET = 900
+# Override time budget: 1 hour for deeper training on M4
+TIME_BUDGET = 3600
 
 # ---------------------------------------------------------------------------
 # GPT Model (MPS-compatible, no Flash Attention, no bfloat16)
@@ -430,13 +430,20 @@ if __name__ == "__main__":
     # and recompilation during autoregressive generation (variable seq lengths)
     print("torch.compile: disabled (MPS overhead too high)")
 
-    train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
+    # Curriculum learning: short sequences first, ramp to full context
+    # Phase 1: T=256 (learn VHDL keywords, types, basic syntax)
+    # Phase 2: T=512 (learn entity/architecture structure)
+    # Phase 3: T=1024 (learn full document structure)
+    CURRICULUM = [(0.0, 256), (0.15, 512), (0.35, MAX_SEQ_LEN)]
+    curr_T = CURRICULUM[0][1]
+    train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, curr_T, "train")
     x, y, epoch = next(train_loader)
 
     pretrain_budget = int(TIME_BUDGET * PRETRAIN_RATIO)
     feedback_budget = TIME_BUDGET - pretrain_budget
     print(f"Time budget: {TIME_BUDGET}s (pretrain: {pretrain_budget}s, feedback: {feedback_budget}s)")
     print(f"Gradient accumulation steps: {grad_accum_steps}")
+    print(f"Curriculum: {[(f'{p:.0%}', t) for p, t in CURRICULUM]}")
 
     # Schedules (cosine with warmup)
     import math as _math
@@ -459,9 +466,22 @@ if __name__ == "__main__":
     smooth_train_loss = 0
     total_training_time = 0
     step = 0
+    progress = 0.0
 
     while True:
         t0 = time.time()
+
+        # Curriculum: check if we need to switch to longer sequences
+        new_T = CURRICULUM[0][1]
+        for threshold, t_len in CURRICULUM:
+            if progress >= threshold:
+                new_T = t_len
+        if new_T != curr_T:
+            curr_T = new_T
+            train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, curr_T, "train")
+            x, y, epoch = next(train_loader)
+            print(f"\n[Curriculum] Switching to T={curr_T}")
+
         for micro_step in range(grad_accum_steps):
             with autocast_ctx:
                 loss = model(x, y)
@@ -497,10 +517,11 @@ if __name__ == "__main__":
         smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
         debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))
         pct_done = 100 * progress
-        tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
+        actual_tokens = DEVICE_BATCH_SIZE * curr_T * grad_accum_steps
+        tok_per_sec = int(actual_tokens / dt)
         remaining = max(0, pretrain_budget - total_training_time)
 
-        print(f"\r[P1] step {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
+        print(f"\r[P1] step {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | T={curr_T} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
 
         # GC management
         if step == 0:
