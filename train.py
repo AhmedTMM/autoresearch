@@ -199,7 +199,7 @@ ASPECT_RATIO = 48       # model_dim = depth * ASPECT_RATIO
 HEAD_DIM = 64           # target head dimension for attention
 
 # Optimization
-TOTAL_BATCH_SIZE = 2**16  # ~65K tokens per optimizer step (halved for faster steps)
+TOTAL_BATCH_SIZE = 2**15  # ~32K tokens per step (smaller = more steps in budget)
 LEARNING_RATE = 3e-4      # AdamW learning rate
 WEIGHT_DECAY = 0.1
 ADAM_BETAS = (0.9, 0.95)
@@ -207,8 +207,8 @@ WARMUP_RATIO = 0.05
 WARMDOWN_RATIO = 0.5
 FINAL_LR_FRAC = 0.0
 
-# Model size — tuned for 16GB M4, ~40M params
-DEPTH = 10              # number of transformer layers
+# Model size — tuned for 16GB M4, ~20M params
+DEPTH = 8               # number of transformer layers
 DEVICE_BATCH_SIZE = 16   # per-device batch size (halved for 16GB RAM)
 
 # ---------------------------------------------------------------------------
@@ -425,12 +425,9 @@ if __name__ == "__main__":
         weight_decay=WEIGHT_DECAY,
     )
 
-    # Try torch.compile — may not work on MPS, fall back gracefully
-    try:
-        model = torch.compile(model, dynamic=False)
-        print("torch.compile: enabled")
-    except Exception as e:
-        print(f"torch.compile: disabled ({e})")
+    # torch.compile disabled: causes 3min compilation overhead on MPS
+    # and recompilation during autoregressive generation (variable seq lengths)
+    print("torch.compile: disabled (MPS overhead too high)")
 
     train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
     x, y, epoch = next(train_loader)
