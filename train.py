@@ -239,8 +239,11 @@ VHDL_PROMPTS = [
 
 @torch.no_grad()
 def generate_vhdl(model, tokenizer, prompt, device, max_new_tokens=512, temperature=0.8, top_k=50):
-    """Autoregressive VHDL generation."""
-    ids = tokenizer.encode(prompt)
+    """Autoregressive VHDL generation. prompt can be a string or list of token IDs."""
+    if isinstance(prompt, list):
+        ids = prompt
+    else:
+        ids = tokenizer.encode(prompt)
     if len(ids) >= MAX_SEQ_LEN:
         ids = ids[:MAX_SEQ_LEN - 1]
     x = torch.tensor([ids], dtype=torch.long, device=device)
@@ -306,7 +309,7 @@ def compile_vhdl(code, mode="analyze", timeout=10):
 
 # Instruction tuning
 PRETRAIN_RATIO = 1.0            # all time for pretraining (instruction data mixed in)
-INSTRUCTION_MIX_RATIO = 0.1    # 10% of micro-steps use instruction data
+INSTRUCTION_MIX_RATIO = 0.05   # 5% of micro-steps use instruction data
 INST_TOKEN = "<|reserved_1|>"
 RESP_TOKEN = "<|reserved_2|>"
 

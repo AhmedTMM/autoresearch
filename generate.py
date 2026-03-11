@@ -62,13 +62,17 @@ def main():
     model, tokenizer, device = load_model(args.checkpoint)
 
     if args.chat:
-        # Chat mode: format English as instruction prompt
-        prompt = f"{INST_TOKEN}{args.chat}{RESP_TOKEN}"
+        # Chat mode: manually construct token IDs with proper special tokens
+        inst_id = tokenizer.enc.encode_single_token(INST_TOKEN)
+        resp_id = tokenizer.enc.encode_single_token(RESP_TOKEN)
+        desc_ids = tokenizer.encode(args.chat)
+        prompt_ids = [inst_id] + desc_ids + [resp_id]
+
         print(f"\nChat: {args.chat}")
         print('='*60)
 
         for i in range(args.n):
-            code = generate_vhdl(model, tokenizer, prompt, device,
+            code = generate_vhdl(model, tokenizer, prompt_ids, device,
                                max_new_tokens=args.max_tokens,
                                temperature=args.temperature, top_k=args.top_k)
             # Strip instruction tokens from output
