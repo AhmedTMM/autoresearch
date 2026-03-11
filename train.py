@@ -17,8 +17,8 @@ import torch.nn.functional as F
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET as _TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
-# Override time budget: 1 hour for deeper training on M4
-TIME_BUDGET = 3600
+# Override time budget: 3 hours for deep training on M4
+TIME_BUDGET = 10800
 
 # ---------------------------------------------------------------------------
 # GPT Model (MPS-compatible, no Flash Attention, no bfloat16)
@@ -293,13 +293,178 @@ def compile_vhdl(code, mode="analyze", timeout=10):
 # Compiler feedback: rejection sampling
 # ---------------------------------------------------------------------------
 
-# Phase split: 90% pretraining, 10% compiler feedback
-# Generation on MPS is extremely slow (~60s per sample), so minimize feedback phase
-PRETRAIN_RATIO = 1.00     # skip feedback: 0% accepted, wastes 90s on generation
-FEEDBACK_LR = 1e-4          # lower LR for feedback fine-tuning
-GENERATE_BATCH = 8          # samples to generate per feedback round
-GENERATE_MAX_TOKENS = 256   # max tokens per generated sample (halved for speed)
-GENERATE_TEMPERATURE = 0.9  # slightly higher temp for diversity
+# Phase split: 95% pretraining, 5% template fine-tuning
+PRETRAIN_RATIO = 0.95
+TEMPLATE_LR = 1e-4          # low LR for template memorization
+GENERATE_BATCH = 8
+GENERATE_MAX_TOKENS = 256
+GENERATE_TEMPERATURE = 0.9
+
+# Known-compilable VHDL templates for fine-tuning
+VHDL_TEMPLATES = [
+    """library ieee;
+use ieee.std_logic_1164.all;
+
+entity inverter is
+  port (
+    a : in std_logic;
+    y : out std_logic
+  );
+end entity inverter;
+
+architecture rtl of inverter is
+begin
+  y <= not a;
+end architecture rtl;
+""",
+    """library ieee;
+use ieee.std_logic_1164.all;
+
+entity and_gate is
+  port (
+    a : in std_logic;
+    b : in std_logic;
+    y : out std_logic
+  );
+end entity and_gate;
+
+architecture rtl of and_gate is
+begin
+  y <= a and b;
+end architecture rtl;
+""",
+    """library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+
+entity counter is
+  port (
+    clk   : in  std_logic;
+    reset : in  std_logic;
+    count : out std_logic_vector(7 downto 0)
+  );
+end entity counter;
+
+architecture rtl of counter is
+  signal cnt : unsigned(7 downto 0);
+begin
+  process(clk)
+  begin
+    if rising_edge(clk) then
+      if reset = '1' then
+        cnt <= (others => '0');
+      else
+        cnt <= cnt + 1;
+      end if;
+    end if;
+  end process;
+  count <= std_logic_vector(cnt);
+end architecture rtl;
+""",
+    """library ieee;
+use ieee.std_logic_1164.all;
+
+entity mux2 is
+  port (
+    a   : in  std_logic;
+    b   : in  std_logic;
+    sel : in  std_logic;
+    y   : out std_logic
+  );
+end entity mux2;
+
+architecture rtl of mux2 is
+begin
+  y <= a when sel = '0' else b;
+end architecture rtl;
+""",
+    """library ieee;
+use ieee.std_logic_1164.all;
+
+entity dff is
+  port (
+    clk : in  std_logic;
+    d   : in  std_logic;
+    q   : out std_logic
+  );
+end entity dff;
+
+architecture rtl of dff is
+begin
+  process(clk)
+  begin
+    if rising_edge(clk) then
+      q <= d;
+    end if;
+  end process;
+end architecture rtl;
+""",
+    """library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+
+entity register_file is
+  port (
+    clk   : in  std_logic;
+    we    : in  std_logic;
+    addr  : in  std_logic_vector(1 downto 0);
+    din   : in  std_logic_vector(7 downto 0);
+    dout  : out std_logic_vector(7 downto 0)
+  );
+end entity register_file;
+
+architecture rtl of register_file is
+  type reg_array is array (0 to 3) of std_logic_vector(7 downto 0);
+  signal regs : reg_array;
+begin
+  process(clk)
+  begin
+    if rising_edge(clk) then
+      if we = '1' then
+        regs(to_integer(unsigned(addr))) <= din;
+      end if;
+    end if;
+  end process;
+  dout <= regs(to_integer(unsigned(addr)));
+end architecture rtl;
+""",
+    """library ieee;
+use ieee.std_logic_1164.all;
+
+entity sr_latch is
+  port (
+    s : in  std_logic;
+    r : in  std_logic;
+    q : out std_logic
+  );
+end entity sr_latch;
+
+architecture rtl of sr_latch is
+  signal q_int : std_logic;
+begin
+  q_int <= '1' when s = '1' else
+           '0' when r = '1' else
+           q_int;
+  q <= q_int;
+end architecture rtl;
+""",
+    """library ieee;
+use ieee.std_logic_1164.all;
+
+entity tristate is
+  port (
+    din : in  std_logic;
+    en  : in  std_logic;
+    dout : out std_logic
+  );
+end entity tristate;
+
+architecture rtl of tristate is
+begin
+  dout <= din when en = '1' else 'Z';
+end architecture rtl;
+""",
+]
 
 
 @torch.no_grad()
@@ -539,107 +704,75 @@ if __name__ == "__main__":
     print(f"Phase 1 done: {pretrain_steps} steps, {pretrain_tokens/1e6:.1f}M tokens")
 
     # ===================================================================
-    # PHASE 2: Compiler feedback (rejection sampling fine-tuning)
+    # PHASE 2: Template fine-tuning (memorize compilable VHDL patterns)
     # ===================================================================
 
     print(f"\n{'='*60}")
-    print(f"PHASE 2: Compiler feedback ({feedback_budget}s)")
+    print(f"PHASE 2: Template fine-tuning ({feedback_budget}s)")
     print(f"{'='*60}")
 
     # Lower learning rate for fine-tuning
     for group in optimizer.param_groups:
-        group["lr"] = FEEDBACK_LR
+        group["lr"] = TEMPLATE_LR
 
-    feedback_start = time.time()
-    feedback_time = 0
-    feedback_round = 0
-    total_generated = 0
-    total_accepted = 0
-    feedback_steps = 0
+    # Tokenize all templates
+    template_tokens = []
+    bos = tokenizer.get_bos_token_id()
+    for tmpl in VHDL_TEMPLATES:
+        ids = [bos] + tokenizer.encode(tmpl)
+        template_tokens.extend(ids)
+    print(f"Template tokens: {len(template_tokens):,} from {len(VHDL_TEMPLATES)} templates")
 
-    while feedback_time < feedback_budget:
-        feedback_round += 1
+    # Pack templates into batches
+    row_len = MAX_SEQ_LEN + 1
+    n_template_rows = len(template_tokens) // row_len
+    if n_template_rows > 0:
+        tmpl_buf = torch.tensor(template_tokens[:n_template_rows * row_len], dtype=torch.long)
+        tmpl_buf = tmpl_buf.view(n_template_rows, row_len)
 
-        # --- Generate samples ---
-        model.eval()
-        print(f"\n[P2] Round {feedback_round}: generating {GENERATE_BATCH} samples...", end="", flush=True)
+    model.train()
+    template_start = time.time()
+    template_time = 0
+    template_steps = 0
+
+    while template_time < feedback_budget and n_template_rows > 0:
+        # Train on templates (cycle through)
+        idx = template_steps % n_template_rows
+        batch_end = min(idx + DEVICE_BATCH_SIZE, n_template_rows)
+        if batch_end <= idx:
+            idx = 0
+            batch_end = min(DEVICE_BATCH_SIZE, n_template_rows)
+        tmpl_x = tmpl_buf[idx:batch_end, :-1].to(device)
+        tmpl_y = tmpl_buf[idx:batch_end, 1:].to(device)
+
         with autocast_ctx:
-            samples = generate_vhdl_batch(model, tokenizer, device)
-        total_generated += len(samples)
-
-        # --- Score each sample with GHDL ---
-        scored = []
-        for code in samples:
-            score = score_vhdl(code)
-            scored.append((code, score))
-
-        # Separate into tiers
-        perfect = [code for code, s in scored if s >= 1.0]      # passes full analysis
-        good = [code for code, s in scored if 0.6 <= s < 1.0]   # passes syntax
-        partial = [code for code, s in scored if 0.3 <= s < 0.6] # has structure
-
-        n_perfect = len(perfect)
-        n_good = len(good)
-        n_partial = len(partial)
-        n_rejected = len(samples) - n_perfect - n_good - n_partial
-        print(f" perfect={n_perfect}, good={n_good}, partial={n_partial}, rejected={n_rejected}")
-
-        # --- Build training batch from accepted samples ---
-        # Priority: perfect > good > partial
-        # Weight by quality: perfect samples repeated more
-        accepted = []
-        accepted.extend(perfect * 3)    # triple weight for compilable code
-        accepted.extend(good * 2)       # double weight for syntax-valid
-        accepted.extend(partial)        # single weight for structural
-        total_accepted += len(perfect) + len(good) + len(partial)
-
-        if not accepted:
-            print(f"[P2] Round {feedback_round}: no usable samples, continuing with corpus...")
-            # Fall back to corpus training for one step
-            model.train()
-            with autocast_ctx:
-                loss = model(x, y)
-            loss.backward()
-            optimizer.step()
-            model.zero_grad(set_to_none=True)
-            x, y, epoch = next(train_loader)
-            feedback_steps += 1
-            feedback_time = time.time() - feedback_start
-            continue
-
-        # --- Fine-tune on accepted samples ---
-        model.train()
-        fb_x, fb_y = make_feedback_batch(accepted, tokenizer, device,
-                                         DEVICE_BATCH_SIZE, MAX_SEQ_LEN)
-
-        if fb_x is not None:
-            # Train on compiler-approved code
-            with autocast_ctx:
-                fb_loss = model(fb_x, fb_y)
-            fb_loss.backward()
-            optimizer.step()
-            model.zero_grad(set_to_none=True)
-            feedback_steps += 1
-            print(f"[P2] Round {feedback_round}: feedback loss={fb_loss.item():.4f}")
+            tmpl_loss = model(tmpl_x, tmpl_y)
+        tmpl_loss.backward()
 
         # Also do a corpus step to prevent forgetting
         with autocast_ctx:
             corpus_loss = model(x, y)
         corpus_loss.backward()
+
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         model.zero_grad(set_to_none=True)
         x, y, epoch = next(train_loader)
-        feedback_steps += 1
+        template_steps += 1
 
-        feedback_time = time.time() - feedback_start
-        remaining = max(0, feedback_budget - feedback_time)
-        print(f"[P2] Round {feedback_round}: {feedback_time:.0f}s elapsed, {remaining:.0f}s remaining")
+        template_time = time.time() - template_start
+        if template_steps % 20 == 0:
+            remaining = max(0, feedback_budget - template_time)
+            print(f"\r[P2] step {template_steps} | tmpl_loss: {tmpl_loss.item():.4f} | corpus_loss: {corpus_loss.item():.4f} | remaining: {remaining:.0f}s    ", end="", flush=True)
 
-    print(f"\nPhase 2 done: {feedback_round} rounds, {feedback_steps} steps")
-    print(f"  Generated: {total_generated}, Accepted: {total_accepted} ({100*total_accepted/max(1,total_generated):.0f}%)")
+    print(f"\nPhase 2 done: {template_steps} template fine-tuning steps")
 
-    total_training_time += feedback_time
-    total_tokens = pretrain_tokens + feedback_steps * TOTAL_BATCH_SIZE
+    total_training_time += template_time
+    total_tokens = pretrain_tokens + template_steps * TOTAL_BATCH_SIZE
+    feedback_round = 0
+    total_generated = 0
+    total_accepted = 0
+    feedback_time = template_time
 
     # ===================================================================
     # Final evaluation
@@ -660,7 +793,8 @@ if __name__ == "__main__":
     for i in range(NUM_COMPILE_SAMPLES):
         prompt = VHDL_PROMPTS[i % len(VHDL_PROMPTS)]
         with autocast_ctx:
-            code = generate_vhdl(model, tokenizer, prompt, device)
+            code = generate_vhdl(model, tokenizer, prompt, device,
+                             max_new_tokens=256, temperature=0.4, top_k=30)
         s_ok, _, _ = compile_vhdl(code, mode="syntax")
         a_ok, _, _ = compile_vhdl(code, mode="analyze")
         if a_ok:
@@ -688,6 +822,6 @@ if __name__ == "__main__":
     print(f"feedback_accept:  {total_accepted}/{total_generated}")
     print(f"total_seconds:    {t_end - t_start:.1f}")
     print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
-    print(f"num_steps:        {pretrain_steps + feedback_steps}")
+    print(f"num_steps:        {pretrain_steps + template_steps}")
     print(f"num_params_M:     {num_params / 1e6:.1f}")
     print(f"depth:            {DEPTH}")
