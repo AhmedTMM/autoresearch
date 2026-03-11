@@ -75,9 +75,14 @@ def main():
             code = generate_vhdl(model, tokenizer, prompt_ids, device,
                                max_new_tokens=args.max_tokens,
                                temperature=args.temperature, top_k=args.top_k)
-            # Strip instruction tokens from output
+            # Strip instruction tokens and prompt text from output
             for tok in [INST_TOKEN, RESP_TOKEN]:
                 code = code.replace(tok, "")
+            # Remove the instruction text prefix (everything before 'library')
+            import re
+            lib_match = re.search(r'(?i)(library\s)', code)
+            if lib_match:
+                code = code[lib_match.start():]
             print(code)
 
             if args.compile:
