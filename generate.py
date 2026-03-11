@@ -4,6 +4,7 @@ Generate VHDL code from a trained model and optionally compile with GHDL.
 Usage:
     uv run generate.py                                    # generate with default prompt
     uv run generate.py --prompt "library ieee;"           # custom prompt
+    uv run generate.py --chat "Design a counter"          # chat mode (English -> VHDL)
     uv run generate.py --n 10 --compile                   # generate 10 samples, compile each
     uv run generate.py --compile --save-dir ./generated   # save compilable VHDL files
 """
@@ -15,6 +16,7 @@ import torch
 
 from prepare import Tokenizer
 from train import GPT, build_model_config, generate_vhdl, compile_vhdl, DEPTH, VHDL_PROMPTS
+from train import INST_TOKEN, RESP_TOKEN
 
 
 def load_model(checkpoint_path="model.pt"):
@@ -47,6 +49,7 @@ def load_model(checkpoint_path="model.pt"):
 def main():
     parser = argparse.ArgumentParser(description="Generate VHDL from trained model")
     parser.add_argument("--prompt", type=str, default=None, help="VHDL prompt to complete")
+    parser.add_argument("--chat", type=str, default=None, help="Chat mode: English description -> VHDL")
     parser.add_argument("--checkpoint", type=str, default="model.pt", help="Model checkpoint path")
     parser.add_argument("--max-tokens", type=int, default=512, help="Max tokens to generate")
     parser.add_argument("--temperature", type=float, default=0.8, help="Sampling temperature")
@@ -58,7 +61,29 @@ def main():
 
     model, tokenizer, device = load_model(args.checkpoint)
 
-    if args.compile and args.n > 1:
+    if args.chat:
+        # Chat mode: format English as instruction prompt
+        prompt = f"{INST_TOKEN}{args.chat}{RESP_TOKEN}"
+        print(f"\nChat: {args.chat}")
+        print('='*60)
+
+        for i in range(args.n):
+            code = generate_vhdl(model, tokenizer, prompt, device,
+                               max_new_tokens=args.max_tokens,
+                               temperature=args.temperature, top_k=args.top_k)
+            # Strip instruction tokens from output
+            for tok in [INST_TOKEN, RESP_TOKEN]:
+                code = code.replace(tok, "")
+            print(code)
+
+            if args.compile:
+                success, error, _ = compile_vhdl(code)
+                print(f"\n--- GHDL: {'PASS' if success else 'FAIL'} ---")
+                if error:
+                    print(error)
+            if i < args.n - 1:
+                print(f"\n{'='*60}")
+    elif args.compile and args.n > 1:
         # Batch compile evaluation mode
         print(f"\nGenerating {args.n} samples and compiling...")
         compiled_ok = 0

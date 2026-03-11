@@ -6,6 +6,8 @@ Usage: uv run train.py
 
 import os
 import gc
+import random
+import re
 import subprocess
 import tempfile
 import time
@@ -242,6 +244,7 @@ def generate_vhdl(model, tokenizer, prompt, device, max_new_tokens=512, temperat
     if len(ids) >= MAX_SEQ_LEN:
         ids = ids[:MAX_SEQ_LEN - 1]
     x = torch.tensor([ids], dtype=torch.long, device=device)
+    bos_id = tokenizer.get_bos_token_id()
 
     for _ in range(max_new_tokens):
         x_cond = x if x.size(1) <= MAX_SEQ_LEN else x[:, -MAX_SEQ_LEN:]
@@ -252,9 +255,17 @@ def generate_vhdl(model, tokenizer, prompt, device, max_new_tokens=512, temperat
             logits[logits < v[:, [-1]]] = -float('inf')
         probs = F.softmax(logits, dim=-1)
         next_token = torch.multinomial(probs, num_samples=1)
+        if next_token.item() == bos_id:
+            break
         x = torch.cat([x, next_token], dim=1)
 
-    return tokenizer.decode(x[0].tolist())
+    code = tokenizer.decode(x[0].tolist())
+    # Extract first complete VHDL unit (up to end of architecture/entity)
+    import re
+    m = re.search(r'(?i)(end\s+architecture\s*\w*\s*;|end\s+\w+\s*;)', code)
+    if m:
+        code = code[:m.end()]
+    return code
 
 
 def compile_vhdl(code, mode="analyze", timeout=10):
@@ -293,16 +304,21 @@ def compile_vhdl(code, mode="analyze", timeout=10):
 # Compiler feedback: rejection sampling
 # ---------------------------------------------------------------------------
 
-# Phase split: 95% pretraining, 5% template fine-tuning
-PRETRAIN_RATIO = 0.95
-TEMPLATE_LR = 1e-4          # low LR for template memorization
+# Instruction tuning
+PRETRAIN_RATIO = 1.0            # all time for pretraining (instruction data mixed in)
+INSTRUCTION_MIX_RATIO = 0.1    # 10% of micro-steps use instruction data
+INST_TOKEN = "<|reserved_1|>"
+RESP_TOKEN = "<|reserved_2|>"
+
 GENERATE_BATCH = 8
 GENERATE_MAX_TOKENS = 256
 GENERATE_TEMPERATURE = 0.9
 
-# Known-compilable VHDL templates for fine-tuning
-VHDL_TEMPLATES = [
-    """library ieee;
+# (description_variants, vhdl_code) pairs for instruction tuning
+# Each entry: (list_of_descriptions, vhdl_code_string)
+INSTRUCTION_DATA = [
+    (["an inverter", "a NOT gate", "an inverter gate", "a logic inverter"],
+     """library ieee;
 use ieee.std_logic_1164.all;
 
 entity inverter is
@@ -316,8 +332,9 @@ architecture rtl of inverter is
 begin
   y <= not a;
 end architecture rtl;
-""",
-    """library ieee;
+"""),
+    (["an AND gate", "a 2-input AND gate", "a logical AND gate"],
+     """library ieee;
 use ieee.std_logic_1164.all;
 
 entity and_gate is
@@ -332,8 +349,9 @@ architecture rtl of and_gate is
 begin
   y <= a and b;
 end architecture rtl;
-""",
-    """library ieee;
+"""),
+    (["an 8-bit counter", "a counter with synchronous reset", "an 8-bit binary counter with reset"],
+     """library ieee;
 use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
 
@@ -360,8 +378,9 @@ begin
   end process;
   count <= std_logic_vector(cnt);
 end architecture rtl;
-""",
-    """library ieee;
+"""),
+    (["a 2-to-1 multiplexer", "a 2-to-1 mux", "a mux with two inputs"],
+     """library ieee;
 use ieee.std_logic_1164.all;
 
 entity mux2 is
@@ -377,8 +396,9 @@ architecture rtl of mux2 is
 begin
   y <= a when sel = '0' else b;
 end architecture rtl;
-""",
-    """library ieee;
+"""),
+    (["a D flip-flop", "a DFF", "a D-type flip-flop", "a single-bit register"],
+     """library ieee;
 use ieee.std_logic_1164.all;
 
 entity dff is
@@ -398,8 +418,9 @@ begin
     end if;
   end process;
 end architecture rtl;
-""",
-    """library ieee;
+"""),
+    (["a register file", "a 4-entry register file", "a register file with 8-bit data"],
+     """library ieee;
 use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
 
@@ -427,8 +448,9 @@ begin
   end process;
   dout <= regs(to_integer(unsigned(addr)));
 end architecture rtl;
-""",
-    """library ieee;
+"""),
+    (["an SR latch", "a set-reset latch", "an SR flip-flop"],
+     """library ieee;
 use ieee.std_logic_1164.all;
 
 entity sr_latch is
@@ -447,8 +469,9 @@ begin
            q_int;
   q <= q_int;
 end architecture rtl;
-""",
-    """library ieee;
+"""),
+    (["a tristate buffer", "a tri-state buffer", "a tristate output driver"],
+     """library ieee;
 use ieee.std_logic_1164.all;
 
 entity tristate is
@@ -463,8 +486,357 @@ architecture rtl of tristate is
 begin
   dout <= din when en = '1' else 'Z';
 end architecture rtl;
-""",
+"""),
+    (["a half adder", "a half-adder circuit", "a 1-bit half adder"],
+     """library ieee;
+use ieee.std_logic_1164.all;
+
+entity half_adder is
+  port (a, b : in std_logic; sum_out, carry : out std_logic);
+end entity half_adder;
+
+architecture rtl of half_adder is
+begin
+  sum_out <= a xor b;
+  carry <= a and b;
+end architecture rtl;
+"""),
+    (["a full adder", "a full-adder circuit", "a 1-bit full adder with carry"],
+     """library ieee;
+use ieee.std_logic_1164.all;
+
+entity full_adder is
+  port (a, b, cin : in std_logic; sum_out, cout : out std_logic);
+end entity full_adder;
+
+architecture rtl of full_adder is
+begin
+  sum_out <= a xor b xor cin;
+  cout <= (a and b) or (cin and (a xor b));
+end architecture rtl;
+"""),
+    (["an OR gate", "a 2-input OR gate", "a logical OR gate"],
+     """library ieee;
+use ieee.std_logic_1164.all;
+
+entity or_gate is
+  port (a, b : in std_logic; y : out std_logic);
+end entity or_gate;
+
+architecture rtl of or_gate is
+begin
+  y <= a or b;
+end architecture rtl;
+"""),
+    (["an XOR gate", "a 2-input XOR gate", "an exclusive-OR gate"],
+     """library ieee;
+use ieee.std_logic_1164.all;
+
+entity xor_gate is
+  port (a, b : in std_logic; y : out std_logic);
+end entity xor_gate;
+
+architecture rtl of xor_gate is
+begin
+  y <= a xor b;
+end architecture rtl;
+"""),
+    (["a NAND gate", "a 2-input NAND gate"],
+     """library ieee;
+use ieee.std_logic_1164.all;
+
+entity nand_gate is
+  port (a, b : in std_logic; y : out std_logic);
+end entity nand_gate;
+
+architecture rtl of nand_gate is
+begin
+  y <= not (a and b);
+end architecture rtl;
+"""),
+    (["a NOR gate", "a 2-input NOR gate"],
+     """library ieee;
+use ieee.std_logic_1164.all;
+
+entity nor_gate is
+  port (a, b : in std_logic; y : out std_logic);
+end entity nor_gate;
+
+architecture rtl of nor_gate is
+begin
+  y <= not (a or b);
+end architecture rtl;
+"""),
+    (["a 4-to-1 multiplexer", "a 4-to-1 mux", "a 4-input mux with 2-bit select"],
+     """library ieee;
+use ieee.std_logic_1164.all;
+
+entity mux4 is
+  port (
+    a, b, c, d : in std_logic;
+    sel : in std_logic_vector(1 downto 0);
+    y : out std_logic
+  );
+end entity mux4;
+
+architecture rtl of mux4 is
+begin
+  with sel select
+    y <= a when "00",
+         b when "01",
+         c when "10",
+         d when others;
+end architecture rtl;
+"""),
+    (["an 8-bit comparator", "a comparator with equal, greater, less outputs"],
+     """library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+
+entity comparator is
+  port (
+    a : in std_logic_vector(7 downto 0);
+    b : in std_logic_vector(7 downto 0);
+    eq : out std_logic;
+    gt : out std_logic;
+    lt : out std_logic
+  );
+end entity comparator;
+
+architecture rtl of comparator is
+begin
+  eq <= '1' when a = b else '0';
+  gt <= '1' when unsigned(a) > unsigned(b) else '0';
+  lt <= '1' when unsigned(a) < unsigned(b) else '0';
+end architecture rtl;
+"""),
+    (["a clock divider", "a frequency divider", "a clock divider by 256"],
+     """library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+
+entity clock_divider is
+  port (
+    clk_in : in std_logic;
+    reset : in std_logic;
+    clk_out : out std_logic
+  );
+end entity clock_divider;
+
+architecture rtl of clock_divider is
+  signal counter : unsigned(7 downto 0);
+  signal clk_reg : std_logic;
+begin
+  process(clk_in)
+  begin
+    if rising_edge(clk_in) then
+      if reset = '1' then
+        counter <= (others => '0');
+        clk_reg <= '0';
+      else
+        if counter = 127 then
+          counter <= (others => '0');
+          clk_reg <= not clk_reg;
+        else
+          counter <= counter + 1;
+        end if;
+      end if;
+    end if;
+  end process;
+  clk_out <= clk_reg;
+end architecture rtl;
+"""),
+    (["an 8-bit shift register", "a serial-in parallel-out shift register", "a shift register with reset"],
+     """library ieee;
+use ieee.std_logic_1164.all;
+
+entity shift_register is
+  port (
+    clk : in std_logic;
+    reset : in std_logic;
+    din : in std_logic;
+    dout : out std_logic_vector(7 downto 0)
+  );
+end entity shift_register;
+
+architecture rtl of shift_register is
+  signal reg : std_logic_vector(7 downto 0);
+begin
+  process(clk)
+  begin
+    if rising_edge(clk) then
+      if reset = '1' then
+        reg <= (others => '0');
+      else
+        reg <= reg(6 downto 0) & din;
+      end if;
+    end if;
+  end process;
+  dout <= reg;
+end architecture rtl;
+"""),
+    (["a 3-to-8 decoder", "a decoder with enable", "a 3-to-8 line decoder"],
+     """library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+
+entity decoder_3to8 is
+  port (
+    sel : in std_logic_vector(2 downto 0);
+    en : in std_logic;
+    y : out std_logic_vector(7 downto 0)
+  );
+end entity decoder_3to8;
+
+architecture rtl of decoder_3to8 is
+begin
+  process(sel, en)
+  begin
+    y <= (others => '0');
+    if en = '1' then
+      y(to_integer(unsigned(sel))) <= '1';
+    end if;
+  end process;
+end architecture rtl;
+"""),
+    (["a parity generator", "an 8-bit parity checker", "an even parity generator"],
+     """library ieee;
+use ieee.std_logic_1164.all;
+
+entity parity_generator is
+  port (
+    din : in std_logic_vector(7 downto 0);
+    parity : out std_logic
+  );
+end entity parity_generator;
+
+architecture rtl of parity_generator is
+begin
+  parity <= din(0) xor din(1) xor din(2) xor din(3) xor din(4) xor din(5) xor din(6) xor din(7);
+end architecture rtl;
+"""),
+    (["a buffer gate", "a unity-gain buffer", "a simple buffer"],
+     """library ieee;
+use ieee.std_logic_1164.all;
+
+entity buffer_gate is
+  port (
+    a : in std_logic;
+    y : out std_logic
+  );
+end entity buffer_gate;
+
+architecture rtl of buffer_gate is
+begin
+  y <= a;
+end architecture rtl;
+"""),
+    (["a JK flip-flop", "a JK flipflop", "a JK-type flip-flop"],
+     """library ieee;
+use ieee.std_logic_1164.all;
+
+entity jk_flipflop is
+  port (
+    clk : in std_logic;
+    j   : in std_logic;
+    k   : in std_logic;
+    q   : out std_logic
+  );
+end entity jk_flipflop;
+
+architecture rtl of jk_flipflop is
+  signal q_int : std_logic := '0';
+begin
+  process(clk)
+  begin
+    if rising_edge(clk) then
+      if j = '1' and k = '1' then
+        q_int <= not q_int;
+      elsif j = '1' then
+        q_int <= '1';
+      elsif k = '1' then
+        q_int <= '0';
+      end if;
+    end if;
+  end process;
+  q <= q_int;
+end architecture rtl;
+"""),
+    (["a T flip-flop", "a toggle flip-flop", "a T-type flip-flop"],
+     """library ieee;
+use ieee.std_logic_1164.all;
+
+entity t_flipflop is
+  port (
+    clk : in std_logic;
+    t   : in std_logic;
+    q   : out std_logic
+  );
+end entity t_flipflop;
+
+architecture rtl of t_flipflop is
+  signal q_int : std_logic := '0';
+begin
+  process(clk)
+  begin
+    if rising_edge(clk) then
+      if t = '1' then
+        q_int <= not q_int;
+      end if;
+    end if;
+  end process;
+  q <= q_int;
+end architecture rtl;
+"""),
 ]
+
+# Instruction prompt templates for variety
+INSTRUCTION_FORMATS = [
+    "Design {desc}",
+    "Write VHDL code for {desc}",
+    "Create {desc} in VHDL",
+    "Implement {desc}",
+    "Write a VHDL module for {desc}",
+    "Generate VHDL for {desc}",
+    "Code {desc} in VHDL",
+    "Build {desc} using VHDL",
+    "Write the VHDL for {desc}",
+    "{desc}",
+]
+
+# Keep VHDL_TEMPLATES for backward compatibility (generate.py uses it)
+VHDL_TEMPLATES = [code for _, code in INSTRUCTION_DATA]
+
+
+def build_instruction_pairs():
+    """Build all (instruction_string, vhdl_code) pairs from templates."""
+    pairs = []
+    for desc_variants, code in INSTRUCTION_DATA:
+        for desc in desc_variants:
+            for fmt in INSTRUCTION_FORMATS:
+                pairs.append((fmt.format(desc=desc), code))
+    return pairs
+
+
+def get_instruction_batch(pairs, tokenizer, device, batch_size, seq_len):
+    """Create a training batch from instruction pairs."""
+    inst_id = tokenizer.enc.encode_single_token(INST_TOKEN)
+    resp_id = tokenizer.enc.encode_single_token(RESP_TOKEN)
+    bos_id = tokenizer.get_bos_token_id()
+
+    row_len = seq_len + 1
+    all_tokens = []
+    while len(all_tokens) < batch_size * row_len * 2:
+        desc, code = random.choice(pairs)
+        tokens = [bos_id, inst_id] + tokenizer.encode(desc) + [resp_id] + tokenizer.encode(code)
+        all_tokens.extend(tokens)
+
+    num_rows = min(batch_size, len(all_tokens) // row_len)
+    buf = torch.tensor(all_tokens[:num_rows * row_len], dtype=torch.long)
+    buf = buf.view(num_rows, row_len)
+    x = buf[:, :-1].to(device)
+    y = buf[:, 1:].to(device)
+    return x, y
 
 
 @torch.no_grad()
@@ -604,11 +976,15 @@ if __name__ == "__main__":
     train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, curr_T, "train")
     x, y, epoch = next(train_loader)
 
-    pretrain_budget = int(TIME_BUDGET * PRETRAIN_RATIO)
-    feedback_budget = TIME_BUDGET - pretrain_budget
-    print(f"Time budget: {TIME_BUDGET}s (pretrain: {pretrain_budget}s, feedback: {feedback_budget}s)")
+    pretrain_budget = TIME_BUDGET
+    print(f"Time budget: {TIME_BUDGET}s")
     print(f"Gradient accumulation steps: {grad_accum_steps}")
     print(f"Curriculum: {[(f'{p:.0%}', t) for p, t in CURRICULUM]}")
+    print(f"Instruction mix ratio: {INSTRUCTION_MIX_RATIO:.0%}")
+
+    # Build instruction pairs for chat training
+    instruction_pairs = build_instruction_pairs()
+    print(f"Instruction pairs: {len(instruction_pairs)}")
 
     # Schedules (cosine with warmup)
     import math as _math
@@ -648,12 +1024,20 @@ if __name__ == "__main__":
             print(f"\n[Curriculum] Switching to T={curr_T}")
 
         for micro_step in range(grad_accum_steps):
-            with autocast_ctx:
-                loss = model(x, y)
+            # Mix instruction data at INSTRUCTION_MIX_RATIO
+            if random.random() < INSTRUCTION_MIX_RATIO:
+                inst_x, inst_y = get_instruction_batch(
+                    instruction_pairs, tokenizer, device,
+                    batch_size=DEVICE_BATCH_SIZE, seq_len=curr_T)
+                with autocast_ctx:
+                    loss = model(inst_x, inst_y)
+            else:
+                with autocast_ctx:
+                    loss = model(x, y)
+                x, y, epoch = next(train_loader)
             train_loss = loss.detach()
             loss = loss / grad_accum_steps
             loss.backward()
-            x, y, epoch = next(train_loader)
 
         # Progress and schedules (relative to pretrain budget)
         progress = min(total_training_time / pretrain_budget, 1.0)
@@ -703,76 +1087,12 @@ if __name__ == "__main__":
     pretrain_tokens = step * TOTAL_BATCH_SIZE
     print(f"Phase 1 done: {pretrain_steps} steps, {pretrain_tokens/1e6:.1f}M tokens")
 
-    # ===================================================================
-    # PHASE 2: Template fine-tuning (memorize compilable VHDL patterns)
-    # ===================================================================
-
-    print(f"\n{'='*60}")
-    print(f"PHASE 2: Template fine-tuning ({feedback_budget}s)")
-    print(f"{'='*60}")
-
-    # Lower learning rate for fine-tuning
-    for group in optimizer.param_groups:
-        group["lr"] = TEMPLATE_LR
-
-    # Tokenize all templates
-    template_tokens = []
-    bos = tokenizer.get_bos_token_id()
-    for tmpl in VHDL_TEMPLATES:
-        ids = [bos] + tokenizer.encode(tmpl)
-        template_tokens.extend(ids)
-    print(f"Template tokens: {len(template_tokens):,} from {len(VHDL_TEMPLATES)} templates")
-
-    # Pack templates into batches
-    row_len = MAX_SEQ_LEN + 1
-    n_template_rows = len(template_tokens) // row_len
-    if n_template_rows > 0:
-        tmpl_buf = torch.tensor(template_tokens[:n_template_rows * row_len], dtype=torch.long)
-        tmpl_buf = tmpl_buf.view(n_template_rows, row_len)
-
-    model.train()
-    template_start = time.time()
-    template_time = 0
-    template_steps = 0
-
-    while template_time < feedback_budget and n_template_rows > 0:
-        # Train on templates (cycle through)
-        idx = template_steps % n_template_rows
-        batch_end = min(idx + DEVICE_BATCH_SIZE, n_template_rows)
-        if batch_end <= idx:
-            idx = 0
-            batch_end = min(DEVICE_BATCH_SIZE, n_template_rows)
-        tmpl_x = tmpl_buf[idx:batch_end, :-1].to(device)
-        tmpl_y = tmpl_buf[idx:batch_end, 1:].to(device)
-
-        with autocast_ctx:
-            tmpl_loss = model(tmpl_x, tmpl_y)
-        tmpl_loss.backward()
-
-        # Also do a corpus step to prevent forgetting
-        with autocast_ctx:
-            corpus_loss = model(x, y)
-        corpus_loss.backward()
-
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-        model.zero_grad(set_to_none=True)
-        x, y, epoch = next(train_loader)
-        template_steps += 1
-
-        template_time = time.time() - template_start
-        if template_steps % 20 == 0:
-            remaining = max(0, feedback_budget - template_time)
-            print(f"\r[P2] step {template_steps} | tmpl_loss: {tmpl_loss.item():.4f} | corpus_loss: {corpus_loss.item():.4f} | remaining: {remaining:.0f}s    ", end="", flush=True)
-
-    print(f"\nPhase 2 done: {template_steps} template fine-tuning steps")
-
-    total_training_time += template_time
-    total_tokens = pretrain_tokens + template_steps * TOTAL_BATCH_SIZE
+    total_tokens = pretrain_tokens
     feedback_round = 0
     total_generated = 0
     total_accepted = 0
-    feedback_time = template_time
+    feedback_time = 0
+    template_steps = 0
 
     # ===================================================================
     # Final evaluation
