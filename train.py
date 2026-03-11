@@ -809,12 +809,21 @@ VHDL_TEMPLATES = [code for _, code in INSTRUCTION_DATA]
 
 
 def build_instruction_pairs():
-    """Build all (instruction_string, vhdl_code) pairs from templates."""
+    """Build all (instruction_string, vhdl_code) pairs from templates + textbook data."""
     pairs = []
+    # Built-in template pairs (with format variants)
     for desc_variants, code in INSTRUCTION_DATA:
         for desc in desc_variants:
             for fmt in INSTRUCTION_FORMATS:
                 pairs.append((fmt.format(desc=desc), code))
+    # Load textbook instruction pairs if available
+    import json
+    textbook_path = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch", "instruction_pairs.json")
+    if os.path.exists(textbook_path):
+        with open(textbook_path) as f:
+            textbook_pairs = json.load(f)
+        pairs.extend(textbook_pairs)
+        print(f"Loaded {len(textbook_pairs)} textbook instruction pairs")
     return pairs
 
 
